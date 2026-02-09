@@ -3,6 +3,7 @@ package hybrid
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -275,6 +276,8 @@ func runOCRBatch(ctx context.Context, presignedURL string, pages []int, opts typ
 		return map[int]string{}, nil
 	}
 
+	fmt.Fprintf(os.Stderr, "ocr start: pages=%d model=%s\n", len(pages), *opts.OCRModel)
+
 	// Convert to 0-indexed
 	pages0 := make([]int, len(pages))
 	for i, p := range pages {
@@ -290,8 +293,11 @@ func runOCRBatch(ctx context.Context, presignedURL string, pages []int, opts typ
 		opts.ExtractFooter,
 	)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "ocr failed: %v\n", err)
 		return nil, err
 	}
+
+	fmt.Fprintf(os.Stderr, "ocr done: pages=%d model=%s\n", len(ocrResp.Pages), *opts.OCRModel)
 
 	results := make(map[int]string, len(ocrResp.Pages))
 	for _, page := range ocrResp.Pages {

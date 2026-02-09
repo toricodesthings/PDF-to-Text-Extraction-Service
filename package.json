@@ -18,6 +18,6 @@
   },
   "homepage": "https://github.com/toricodesthings/PDF-to-Text-Extraction-Service#readme",
   "devDependencies": {
-    "wrangler": "^4.60.0"
+    "wrangler": "^4.63.0"
   }
 }

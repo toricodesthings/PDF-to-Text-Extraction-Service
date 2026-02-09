@@ -203,7 +203,6 @@ export default {
 
       return json({ success: false, error: "Not found", code: "not_found" }, { status: 404 });
     } catch (error: any) {
-      console.error("worker error", { error: error?.message || "unknown" });
       const isTimeout = error?.message?.includes("timeout") || error?.name === "TimeoutError";
       const isTooBig = error?.message?.includes("too large");
 
