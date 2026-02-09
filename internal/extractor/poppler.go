@@ -54,7 +54,7 @@ func GetPDFInfo(ctx context.Context, pdfPath string, cfg ExtractorConfig) (PDFIn
 	ctx, cancel := context.WithTimeout(ctx, cfg.PDFInfoTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "pdfinfo", "-q", "-upw", "", "-opw", "", pdfPath)
+	cmd := exec.CommandContext(ctx, "pdfinfo", pdfPath)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -111,9 +111,6 @@ func TextForPage(ctx context.Context, pdfPath string, page int, cfg ExtractorCon
 
 	cmd := exec.CommandContext(ctx,
 		"pdftotext",
-		"-q",
-		"-upw", "",
-		"-opw", "",
 		"-f", strconv.Itoa(page),
 		"-l", strconv.Itoa(page),
 		"-layout",
@@ -148,9 +145,6 @@ func ExtractAllPages(ctx context.Context, pdfPath string, cfg ExtractorConfig) (
 
 	cmd := exec.CommandContext(ctx,
 		"pdftotext",
-		"-q",
-		"-upw", "",
-		"-opw", "",
 		"-layout",
 		"-nopgbrk",
 		"-enc", "UTF-8",
@@ -251,24 +245,36 @@ func runCommandCaptureLimited(ctx context.Context, cmd *exec.Cmd, maxBytes int64
 	return string(outBytes), stderrStr, nil
 }
 
+// isHelpOrUsageOutput returns true when stderr looks like a poppler
+// usage / help dump rather than an actual processing error.
+func isHelpOrUsageOutput(stderr string) bool {
+	return strings.Contains(stderr, "version ") && strings.Contains(stderr, "Usage:")
+}
+
 func classifyPopplerErr(tool string, err error, ctx context.Context, stderr string) error {
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("%s timeout: %w", tool, ctx.Err())
 	}
 	stderr = strings.TrimSpace(stderr)
 	if stderr != "" {
-		// map common poppler messages
+		// If poppler printed its help/usage text (bad args, etc.) don't
+		// match on keywords that appear in the help descriptions.
+		if isHelpOrUsageOutput(stderr) {
+			logPopplerErr(tool, stderr, 0)
+			return fmt.Errorf("%s failed (bad invocation): %s", tool, truncate(stderr, 200))
+		}
+
+		// Map common poppler error messages (exact error strings, not
+		// generic words that also appear in --help text).
 		if containsAny(stderr,
 			"Incorrect password",
-			"encrypted",
-			"Encrypted",
+			"Command Line Error: Incorrect password",
 		) {
 			logPopplerErr(tool, stderr, 0)
 			return fmt.Errorf("PDF is password protected")
 		}
 		if containsAny(stderr,
-			"damaged",
-			"invalid",
+			"PDF file is damaged",
 			"Syntax Error",
 			"Couldn't find trailer dictionary",
 			"May not be a PDF file",
@@ -296,11 +302,20 @@ func classifyPdftotextErr(err error, ctx context.Context, stderr string, page in
 
 	stderr = strings.TrimSpace(stderr)
 	if stderr != "" {
-		if containsAny(stderr, "Incorrect password", "password", "encrypted", "Encrypted") {
+		// Guard against help/usage text being misclassified.
+		if isHelpOrUsageOutput(stderr) {
+			logPopplerErr("pdftotext", stderr, page)
+			if page > 0 {
+				return fmt.Errorf("pdftotext page %d failed (bad invocation)", page)
+			}
+			return fmt.Errorf("pdftotext failed (bad invocation)")
+		}
+
+		if containsAny(stderr, "Incorrect password", "Command Line Error: Incorrect password") {
 			logPopplerErr("pdftotext", stderr, page)
 			return fmt.Errorf("PDF is password protected")
 		}
-		if containsAny(stderr, "PDF file is damaged", "damaged", "Syntax Error", "invalid", "May not be a PDF file") {
+		if containsAny(stderr, "PDF file is damaged", "Syntax Error", "Couldn't find trailer dictionary", "May not be a PDF file") {
 			logPopplerErr("pdftotext", stderr, page)
 			return fmt.Errorf("PDF file is damaged or corrupted")
 		}
@@ -342,12 +357,17 @@ func logPopplerErr(tool, stderr string, page int) {
 	if msg == "" {
 		return
 	}
-	if len(msg) > 500 {
-		msg = msg[:500] + "..."
-	}
+	msg = truncate(msg, 500)
 	if page > 0 {
 		fmt.Fprintf(os.Stderr, "%s error (page %d): %s\n", tool, page, msg)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "%s error: %s\n", tool, msg)
+}
+
+func truncate(s string, max int) string {
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }

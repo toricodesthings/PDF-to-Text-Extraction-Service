@@ -383,3 +383,11 @@ func calculateSavings(textLayerPages, totalPages int) int {
 	}
 	return int(float64(textLayerPages) / float64(totalPages) * 100)
 }
+
+func isPasswordProtectedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "password protected") || strings.Contains(msg, "incorrect password")
+}
