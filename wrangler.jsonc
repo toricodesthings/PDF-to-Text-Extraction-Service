@@ -19,7 +19,9 @@
   },
 
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["FileProcContainer"] }
+    { "tag": "v1", "new_sqlite_classes": ["PdfProcContainer"] },
+    { "tag": "v2", "new_sqlite_classes": ["FileProcContainer"] },
+    { "tag": "v3", "deleted_classes": ["PdfProcContainer"] }
   ],
 
   "observability": {
