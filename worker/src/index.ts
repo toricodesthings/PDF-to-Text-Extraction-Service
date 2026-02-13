@@ -4,11 +4,11 @@ import { CONTAINER, CORS_HEADERS, LIMITS, ROUTES, json } from "./constants";
 export interface Env {
   MISTRAL_API_KEY: string;
   OPENROUTER_API_KEY: string;
+  GROQ_API_KEY: string;
   INTERNAL_SHARED_SECRET: string;
   FILE_BUCKET: R2Bucket;
   FILEPROC: { getByName(name: string): FileProcContainer };
-  RATE_LIMITER_PREVIEW: { limit(options: { key: string }): Promise<{ success: boolean }> };
-  RATE_LIMITER_EXTRACT: { limit(options: { key: string }): Promise<{ success: boolean }> };
+  RATE_LIMITER: { limit(options: { key: string }): Promise<{ success: boolean }> };
 }
 
 export class FileProcContainer extends Container {
@@ -40,6 +40,7 @@ async function getReadyInstance(env: Env): Promise<FileProcContainer> {
       envVars: {
         MISTRAL_API_KEY: env.MISTRAL_API_KEY || "",
         OPENROUTER_API_KEY: env.OPENROUTER_API_KEY || "",
+        GROQ_API_KEY: env.GROQ_API_KEY || "",
         INTERNAL_SHARED_SECRET: env.INTERNAL_SHARED_SECRET || "",
       },
     },
@@ -123,7 +124,7 @@ async function createPresignedUrl(bucket: R2Bucket, key: string, expiresInSecond
   return signer.call(bucket, key, { expiresIn: expiresInSeconds });
 }
 
-async function resolvePdfUrl(body: any, bucket: R2Bucket): Promise<string> {
+async function resolveUrl(body: any, bucket: R2Bucket): Promise<string> {
   const presignedUrl = getStringField(body, "presignedUrl");
   if (presignedUrl) return presignedUrl;
 
@@ -136,24 +137,6 @@ async function resolvePdfUrl(body: any, bucket: R2Bucket): Promise<string> {
   }
 
   throw new Error("missing_presigned_or_key");
-}
-
-async function resolveImageUrl(body: any, bucket: R2Bucket): Promise<string> {
-  const imageUrl = getStringField(body, "imageUrl");
-  if (imageUrl) return imageUrl;
-
-  const presignedUrl = getStringField(body, "presignedUrl");
-  if (presignedUrl) return presignedUrl;
-
-  const key = getStringField(body, "key");
-  if (key) {
-    if (!isAllowedR2Key(key)) {
-      throw new Error("invalid_key");
-    }
-    return createPresignedUrl(bucket, key, 600);
-  }
-
-  throw new Error("missing_image_or_key");
 }
 
 async function parseJSONBody(req: Request, maxBytes = LIMITS.JSON_BODY_MAX_BYTES): Promise<any> {
@@ -195,7 +178,7 @@ export default {
 
       if (url.pathname === ROUTES.PREVIEW && req.method === "POST") {
         const clientId = getClientIdentifier(req);
-        const rateLimit = await checkRateLimit(env.RATE_LIMITER_PREVIEW, clientId);
+        const rateLimit = await checkRateLimit(env.RATE_LIMITER, clientId);
         if (!rateLimit.allowed) {
           return json(
             { success: false, error: "Rate limit exceeded", code: "rate_limit" },
@@ -205,7 +188,7 @@ export default {
 
         const body = await parseJSONBody(req);
         try {
-          body.presignedUrl = await resolvePdfUrl(body, env.FILE_BUCKET);
+          body.presignedUrl = await resolveUrl(body, env.FILE_BUCKET);
         } catch (err: any) {
           if (err?.message === "invalid_key") {
             return json({ success: false, error: "Invalid key", code: "bad_request" }, { status: 400 });
@@ -245,7 +228,7 @@ export default {
 
       if (url.pathname === ROUTES.EXTRACT && req.method === "POST") {
         const clientId = getClientIdentifier(req);
-        const rateLimit = await checkRateLimit(env.RATE_LIMITER_EXTRACT, clientId);
+        const rateLimit = await checkRateLimit(env.RATE_LIMITER, clientId);
         if (!rateLimit.allowed) {
           return json(
             { success: false, error: "Rate limit exceeded", code: "rate_limit" },
@@ -255,7 +238,7 @@ export default {
 
         const body = await parseJSONBody(req);
         try {
-          body.presignedUrl = await resolvePdfUrl(body, env.FILE_BUCKET);
+          body.presignedUrl = await resolveUrl(body, env.FILE_BUCKET);
         } catch (err: any) {
           if (err?.message === "invalid_key") {
             return json({ success: false, error: "Invalid key", code: "bad_request" }, { status: 400 });
@@ -293,59 +276,9 @@ export default {
         });
       }
 
-      if (url.pathname === ROUTES.IMAGE_EXTRACT && req.method === "POST") {
-        const clientId = getClientIdentifier(req);
-        const rateLimit = await checkRateLimit(env.RATE_LIMITER_EXTRACT, clientId);
-        if (!rateLimit.allowed) {
-          return json(
-            { success: false, error: "Rate limit exceeded", code: "rate_limit" },
-            { status: 429, headers: { "Retry-After": "60" } }
-          );
-        }
-
-        const body = await parseJSONBody(req);
-        try {
-          body.imageUrl = await resolveImageUrl(body, env.FILE_BUCKET);
-        } catch (err: any) {
-          if (err?.message === "invalid_key") {
-            return json({ success: false, error: "Invalid key", code: "bad_request" }, { status: 400 });
-          }
-          if (err?.message === "not_found") {
-            return json({ success: false, error: "Not found", code: "not_found" }, { status: 404 });
-          }
-          return json(
-            { success: false, error: "imageUrl, presignedUrl, or key required", code: "bad_request" },
-            { status: 400 }
-          );
-        }
-
-        const inst = await getReadyInstance(env);
-        const resp = await inst.fetch(
-          new Request(CONTAINER.IMAGE_EXTRACT_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Internal-Auth": env.INTERNAL_SHARED_SECRET,
-            },
-            body: JSON.stringify(body),
-          })
-        );
-
-        if (!resp.ok) {
-          console.error("image extract container response not ok", {
-            status: resp.status,
-          });
-        }
-
-        return new Response(await resp.text(), {
-          status: resp.status,
-          headers: { "Content-Type": "application/json", ...CORS_HEADERS },
-        });
-      }
-
       if (url.pathname === ROUTES.FILE_PRESIGN && req.method === "POST") {
         const clientId = getClientIdentifier(req);
-        const rateLimit = await checkRateLimit(env.RATE_LIMITER_EXTRACT, clientId);
+        const rateLimit = await checkRateLimit(env.RATE_LIMITER, clientId);
         if (!rateLimit.allowed) {
           return json(
             { success: false, error: "Rate limit exceeded", code: "rate_limit" },

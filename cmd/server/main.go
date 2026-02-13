@@ -12,13 +12,24 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/toricodesthings/file-processing-service/internal/config"
+	"github.com/toricodesthings/file-processing-service/internal/extract"
+	audioextractor "github.com/toricodesthings/file-processing-service/internal/extractors/audio"
+	codeextractor "github.com/toricodesthings/file-processing-service/internal/extractors/code"
+	ebookextractor "github.com/toricodesthings/file-processing-service/internal/extractors/ebook"
+	imageextractor "github.com/toricodesthings/file-processing-service/internal/extractors/image"
+	officeextractor "github.com/toricodesthings/file-processing-service/internal/extractors/office"
+	opendocumentextractor "github.com/toricodesthings/file-processing-service/internal/extractors/opendocument"
+	pdfextractor "github.com/toricodesthings/file-processing-service/internal/extractors/pdf"
+	plaintextextractor "github.com/toricodesthings/file-processing-service/internal/extractors/plaintext"
+	structuredextractor "github.com/toricodesthings/file-processing-service/internal/extractors/structured"
+	videoextractor "github.com/toricodesthings/file-processing-service/internal/extractors/video"
 	"github.com/toricodesthings/file-processing-service/internal/hybrid"
-	"github.com/toricodesthings/file-processing-service/internal/image"
 	"github.com/toricodesthings/file-processing-service/internal/types"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
@@ -29,6 +40,9 @@ var (
 
 	requestSem *semaphore.Weighted
 	ocrSem     *semaphore.Weighted
+	extractRt  *extract.Router
+	extractReg *extract.Registry
+	hybridProc *hybrid.Processor
 
 	// Per-IP rate limiters
 	limiters = &sync.Map{}
@@ -69,34 +83,57 @@ func main() {
 	ocrSem = semaphore.NewWeighted(cfg.MaxOCRConcurrent)
 
 	processor := hybrid.New(cfg)
+	hybridProc = processor
+	registry := extract.NewRegistry()
+	extractReg = registry
+
+	audioX := audioextractor.New(cfg.GroqAPIKey, cfg.GroqAPIURL, cfg.GroqModel, cfg.MaxAudioBytes, cfg.GroqTimeout)
+
+	// Register extractors — order matters: more-specific first
+	registry.Register(pdfextractor.New(processor, cfg.MaxPDFBytes))
+	registry.Register(imageextractor.New(cfg.DefaultOCRModel, cfg.DefaultVisionModel, cfg.VisionRequestTimeout, cfg.MaxImageBytes))
+	registry.Register(plaintextextractor.New(cfg.MaxCodeFileBytes))
+	registry.Register(plaintextextractor.NewHTML(cfg.MaxCodeFileBytes))
+	registry.Register(plaintextextractor.NewRTF(cfg.MaxCodeFileBytes))
+	registry.Register(structuredextractor.NewCSV(cfg.MaxCodeFileBytes))
+	registry.Register(structuredextractor.NewJSON(cfg.MaxCodeFileBytes))
+	registry.Register(structuredextractor.NewXML(cfg.MaxCodeFileBytes))
+	registry.Register(structuredextractor.NewYAML(cfg.MaxCodeFileBytes))
+	registry.Register(codeextractor.NewSource(cfg.MaxCodeFileBytes))
+	registry.Register(codeextractor.NewNotebook(cfg.MaxCodeFileBytes))
+	registry.Register(codeextractor.NewLaTeX(cfg.MaxCodeFileBytes))
+	registry.Register(officeextractor.NewDOCX(cfg.MaxFileBytes))
+	registry.Register(officeextractor.NewXLSX(cfg.MaxFileBytes))
+	registry.Register(officeextractor.NewPPTX(cfg.MaxFileBytes))
+	registry.Register(officeextractor.NewLegacy(cfg.LibreOfficeBinary, cfg.LibreOfficeTimeout, cfg.MaxFileBytes))
+	registry.Register(opendocumentextractor.New(cfg.MaxFileBytes))
+	registry.Register(ebookextractor.NewEPUB(cfg.MaxFileBytes))
+	registry.Register(audioX)
+	registry.Register(videoextractor.New(cfg.FFmpegBinary, cfg.FFmpegTimeout, audioX, cfg.MaxVideoBytes))
+
+	extractRt = extract.NewRouter(registry, cfg.MaxFileBytes, cfg.DownloadTimeout)
 
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/metrics", withInternalAuth(handleMetrics))
 
-	mux.HandleFunc("/pdf/extract",
+	// Universal extraction endpoint — all file types route through here
+	mux.HandleFunc("/extract",
 		withInternalAuth(
 			withRateLimit(
 				withMethod("POST",
 					withConcurrencyLimit(func(w http.ResponseWriter, r *http.Request) {
-						handleExtract(w, r, processor)
+						handleUniversalExtract(w, r)
 					})))))
 
-	mux.HandleFunc("/pdf/preview",
+	// Low-cost preview endpoint — free extraction paths only
+	mux.HandleFunc("/preview",
 		withInternalAuth(
 			withRateLimit(
 				withMethod("POST",
 					withConcurrencyLimit(func(w http.ResponseWriter, r *http.Request) {
-						handlePreview(w, r, processor)
-					})))))
-
-	mux.HandleFunc("/image/extract",
-		withInternalAuth(
-			withRateLimit(
-				withMethod("POST",
-					withConcurrencyLimit(func(w http.ResponseWriter, r *http.Request) {
-						handleImageExtract(w, r)
+						handlePreview(w, r)
 					})))))
 
 	maxHeaderBytes := 1 << 20
@@ -119,6 +156,9 @@ func main() {
 	}
 	if strings.TrimSpace(cfg.OpenRouterAPIKey) == "" {
 		fmt.Fprintln(os.Stderr, "warning: OPENROUTER_API_KEY not set (vision classification will fall back to OCR-only)")
+	}
+	if strings.TrimSpace(cfg.GroqAPIKey) == "" {
+		fmt.Fprintln(os.Stderr, "warning: GROQ_API_KEY not set (audio/video transcription will fail)")
 	}
 
 	go cleanupRateLimiters()
@@ -147,7 +187,6 @@ func cleanupRateLimiters() {
 		fmt.Printf("[stats] active=%d total=%d goroutines=%d mem=%dMB\n",
 			active, total, runtime.NumGoroutine(), m.Alloc/(1<<20))
 
-		// simple clear (if you want smarter: store last-seen timestamps)
 		limiters = &sync.Map{}
 	}
 }
@@ -172,7 +211,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, map[string]any{
 		"status":  status,
 		"active":  active,
-		"version": "1.0.0",
+		"version": "2.0.0",
 	})
 }
 
@@ -190,95 +229,140 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleExtract(w http.ResponseWriter, r *http.Request, processor *hybrid.Processor) {
-	req, err := parseJSON[types.ExtractRequest](r, cfg.MaxJSONBodyBytes)
+func handleUniversalExtract(w http.ResponseWriter, r *http.Request) {
+	req, err := parseJSON[extract.UniversalExtractRequest](r, cfg.MaxJSONBodyBytes)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
 		return
 	}
 
-	if err := validateExtractRequest(req); err != nil {
-		writeErr(w, http.StatusBadRequest, "validation_failed", sanitizeError(err))
+	if strings.TrimSpace(req.PresignedURL) == "" {
+		writeErr(w, http.StatusBadRequest, "validation_failed", "presignedUrl required")
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), cfg.ExtractTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), cfg.UniversalExtractTimeout)
 	defer cancel()
 
-	pdfPath, cleanup, err := downloadPDFToTemp(ctx, req.PresignedURL, cfg.MaxPDFBytes, cfg.DownloadTimeout)
+	res, err := extractRt.Extract(ctx, req)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "download_failed", sanitizeError(err))
+		writeJSON(w, http.StatusBadRequest, res)
 		return
 	}
-	defer cleanup()
 
-	opts := processor.ApplyDefaults(req.Options)
+	writeJSON(w, http.StatusOK, res)
+}
 
-	// OCR capacity gating: acquire only if OCR might occur
-	if opts.OCRTriggerRatio > 0 {
-		if err := ocrSem.Acquire(ctx, 1); err != nil {
-			writeErr(w, http.StatusServiceUnavailable, "ocr_capacity", "OCR at capacity")
+func handlePreview(w http.ResponseWriter, r *http.Request) {
+	req, err := parseJSON[extract.UniversalExtractRequest](r, cfg.MaxJSONBodyBytes)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
+		return
+	}
+
+	if strings.TrimSpace(req.PresignedURL) == "" {
+		writeErr(w, http.StatusBadRequest, "validation_failed", "presignedUrl required")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), cfg.UniversalExtractTimeout)
+	defer cancel()
+
+	fileName := strings.TrimSpace(req.FileName)
+	if fileName == "" {
+		fileName = "input.bin"
+	}
+
+	dl, err := extract.DownloadToTemp(ctx, req.PresignedURL, fileName, cfg.MaxFileBytes, cfg.DownloadTimeout)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": sanitizeError(err)})
+		return
+	}
+	defer dl.Cleanup()
+
+	ext := strings.ToLower(filepath.Ext(fileName))
+	extractor, err := extractReg.Resolve(dl.MIMEType, ext)
+	if err != nil {
+		msg := sanitizeError(err)
+		writeJSON(w, http.StatusBadRequest, extract.Result{Success: false, MIMEType: dl.MIMEType, FileType: "unknown", Error: &msg})
+		return
+	}
+
+	if !isPreviewAllowed(extractor.Name()) {
+		msg := "preview unsupported for this file type"
+		writeJSON(w, http.StatusBadRequest, extract.Result{Success: false, MIMEType: dl.MIMEType, FileType: extractor.Name(), Error: &msg})
+		return
+	}
+
+	previewMaxChars := previewMaxCharsOption(req.Options, cfg.DefaultPreviewMaxChars)
+
+	if extractor.Name() == "document/pdf" {
+		opts := hybridProc.ApplyDefaults(types.HybridProcessorOptions{})
+		if req.Options != nil {
+			opts.PreviewMaxPages = intOption(req.Options, "previewMaxPages", opts.PreviewMaxPages)
+			opts.PreviewMaxChars = intOption(req.Options, "previewMaxChars", opts.PreviewMaxChars)
+			opts.MinWordsThreshold = intOption(req.Options, "minWordsThreshold", opts.MinWordsThreshold)
+		}
+		prev := hybridProc.ProcessPreview(ctx, dl.Path, opts)
+		if prev.Error != nil {
+			writeJSON(w, http.StatusBadRequest, extract.Result{Success: false, Method: "preview-text-layer", FileType: "document/pdf", MIMEType: dl.MIMEType, Error: prev.Error})
 			return
 		}
-		defer ocrSem.Release(1)
+		text := prev.Text
+		if len(text) > previewMaxChars {
+			text = text[:previewMaxChars] + "..."
+		}
+		wcount, ccount := extract.BuildCounts(text)
+		meta := map[string]string{
+			"needsOcr":       strconv.FormatBool(prev.NeedsOCR),
+			"totalPages":     strconv.Itoa(prev.TotalPages),
+			"textLayerPages": strconv.Itoa(prev.TextLayerPages),
+		}
+		writeJSON(w, http.StatusOK, extract.Result{
+			Success:   true,
+			Text:      text,
+			Method:    "preview-text-layer",
+			FileType:  "document/pdf",
+			MIMEType:  dl.MIMEType,
+			Metadata:  meta,
+			WordCount: wcount,
+			CharCount: ccount,
+		})
+		return
 	}
 
-	result, _ := processor.ProcessHybrid(ctx, req.PresignedURL, pdfPath, opts)
-	writeJSON(w, http.StatusOK, result)
-}
+	job := extract.Job{
+		PresignedURL: req.PresignedURL,
+		LocalPath:    dl.Path,
+		FileName:     fileName,
+		MIMEType:     dl.MIMEType,
+		FileSize:     dl.Size,
+		Options:      req.Options,
+	}
 
-func handlePreview(w http.ResponseWriter, r *http.Request, processor *hybrid.Processor) {
-	req, err := parseJSON[types.ExtractRequest](r, cfg.MaxJSONBodyBytes)
+	res, err := extractor.Extract(ctx, job)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
+		if res.Error == nil {
+			msg := sanitizeError(err)
+			res.Error = &msg
+		}
+		res.Success = false
+		if res.MIMEType == "" {
+			res.MIMEType = dl.MIMEType
+		}
+		writeJSON(w, http.StatusBadRequest, res)
 		return
 	}
 
-	if err := validateExtractRequest(req); err != nil {
-		writeErr(w, http.StatusBadRequest, "validation_failed", sanitizeError(err))
-		return
+	if previewMaxChars > 0 && len(res.Text) > previewMaxChars {
+		res.Text = res.Text[:previewMaxChars] + "..."
+		res.WordCount, res.CharCount = extract.BuildCounts(res.Text)
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), cfg.PreviewTimeout)
-	defer cancel()
-
-	pdfPath, cleanup, err := downloadPDFToTemp(ctx, req.PresignedURL, cfg.MaxPDFBytes, cfg.DownloadTimeout)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "download_failed", sanitizeError(err))
-		return
+	res.Success = true
+	if res.MIMEType == "" {
+		res.MIMEType = dl.MIMEType
 	}
-	defer cleanup()
-
-	opts := processor.ApplyDefaults(req.Options)
-	prev := processor.ProcessPreview(ctx, pdfPath, opts)
-
-	writeJSON(w, http.StatusOK, prev)
-}
-
-func handleImageExtract(w http.ResponseWriter, r *http.Request) {
-	req, err := parseJSON[types.ImageExtractRequest](r, cfg.MaxJSONBodyBytes)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
-		return
-	}
-
-	if err := validateImageRequest(req); err != nil {
-		writeErr(w, http.StatusBadRequest, "validation_failed", sanitizeError(err))
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), cfg.ImageExtractTimeout)
-	defer cancel()
-
-	// OCR capacity gating
-	if err := ocrSem.Acquire(ctx, 1); err != nil {
-		writeErr(w, http.StatusServiceUnavailable, "ocr_capacity", "OCR at capacity")
-		return
-	}
-	defer ocrSem.Release(1)
-
-	result, _ := image.ProcessImage(ctx, req.ImageURL, cfg.DefaultOCRModel, cfg.DefaultVisionModel, cfg.VisionRequestTimeout)
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, res)
 }
 
 // ---------- Middleware ----------
@@ -404,42 +488,6 @@ func getClientIP(r *http.Request) string {
 	return host
 }
 
-func validateExtractRequest(req types.ExtractRequest) error {
-	url := strings.TrimSpace(req.PresignedURL)
-	if url == "" {
-		return fmt.Errorf("presignedUrl required")
-	}
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		return fmt.Errorf("presignedUrl must be http/https")
-	}
-	if len(url) > 2048 {
-		return fmt.Errorf("presignedUrl too long")
-	}
-	return nil
-}
-
-func validateImageRequest(req types.ImageExtractRequest) error {
-	url := strings.TrimSpace(req.ImageURL)
-	if url == "" {
-		return fmt.Errorf("imageUrl required")
-	}
-	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-		return fmt.Errorf("imageUrl must be http/https")
-	}
-	maxLen := cfg.MaxImageURLLen
-	if maxLen <= 0 {
-		maxLen = 2048
-	}
-	if len(url) > maxLen {
-		return fmt.Errorf("imageUrl too long")
-	}
-	lower := strings.ToLower(url)
-	if strings.HasSuffix(lower, ".pdf") || strings.Contains(lower, ".pdf?") {
-		return fmt.Errorf("PDF files should use the /extract endpoint, not /image/extract")
-	}
-	return nil
-}
-
 func sanitizeError(err error) string {
 	if err == nil {
 		return ""
@@ -459,6 +507,54 @@ func sanitizeLogString(s string) string {
 		s = s[:200] + "..."
 	}
 	return s
+}
+
+func isPreviewAllowed(fileType string) bool {
+	switch fileType {
+	case "document/pdf", "document/docx", "document/xlsx", "document/pptx", "document/opendocument", "document/epub", "document/rtf", "document/html", "text", "structured/csv", "structured/json", "structured/xml", "structured/yaml", "code/source", "code/notebook", "code/latex":
+		return true
+	default:
+		return false
+	}
+}
+
+func previewMaxCharsOption(options map[string]any, fallback int) int {
+	v := intOption(options, "previewMaxChars", fallback)
+	if v <= 0 {
+		return fallback
+	}
+	return v
+}
+
+func intOption(options map[string]any, key string, fallback int) int {
+	if options == nil {
+		return fallback
+	}
+	v, ok := options[key]
+	if !ok {
+		return fallback
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case float32:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		i, err := n.Int64()
+		if err == nil {
+			return int(i)
+		}
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(n))
+		if err == nil {
+			return i
+		}
+	}
+	return fallback
 }
 
 func parseJSON[T any](r *http.Request, limit int64) (T, error) {
@@ -493,102 +589,4 @@ func writeErr(w http.ResponseWriter, status int, code, message string) {
 		"error":   message,
 		"code":    code,
 	})
-}
-
-// validatePDFMagic checks that a file starts with %PDF (the PDF magic bytes).
-// This catches cases where R2/S3 returns an XML error page, HTML, or other
-// non-PDF content that would otherwise be misclassified by pdfinfo.
-func validatePDFMagic(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open for validation: %w", err)
-	}
-	defer f.Close()
-
-	header := make([]byte, 5)
-	n, err := f.Read(header)
-	if err != nil || n < 5 {
-		return fmt.Errorf("downloaded file is too small to be a valid PDF")
-	}
-
-	if string(header[:4]) != "%PDF" {
-		// Log the first bytes for debugging (safe — it's just magic bytes, not user data)
-		preview := string(header[:n])
-		if len(preview) > 40 {
-			preview = preview[:40]
-		}
-		return fmt.Errorf("downloaded file is not a PDF (starts with %q) — presigned URL may be expired or invalid", preview)
-	}
-	return nil
-}
-
-func downloadPDFToTemp(ctx context.Context, url string, maxBytes int64, timeout time.Duration) (path string, cleanup func(), err error) {
-	tmpDir, err := os.MkdirTemp("", "pdfproc-*")
-	if err != nil {
-		return "", nil, fmt.Errorf("temp dir: %w", err)
-	}
-	cleanup = func() { _ = os.RemoveAll(tmpDir) }
-
-	outPath := filepath.Join(tmpDir, "doc.pdf")
-
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
-	req.Header.Set("User-Agent", "pdfproc/1.0")
-
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			IdleConnTimeout:     30 * time.Second,
-			DisableKeepAlives:   false,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		cleanup()
-		return "", nil, fmt.Errorf("download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		cleanup()
-		return "", nil, fmt.Errorf("download failed: HTTP %d", resp.StatusCode)
-	}
-
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	if ct != "" && !strings.Contains(ct, "pdf") && !strings.Contains(ct, "octet-stream") {
-		cleanup()
-		return "", nil, fmt.Errorf("invalid content-type: %s", ct)
-	}
-
-	f, err := os.Create(outPath)
-	if err != nil {
-		cleanup()
-		return "", nil, fmt.Errorf("create: %w", err)
-	}
-	defer f.Close()
-
-	lr := &io.LimitedReader{R: resp.Body, N: maxBytes + 1}
-	n, err := io.Copy(f, lr)
-	if err != nil {
-		cleanup()
-		return "", nil, fmt.Errorf("write: %w", err)
-	}
-	if n > maxBytes {
-		cleanup()
-		return "", nil, fmt.Errorf("PDF exceeds %dMB limit", maxBytes/(1<<20))
-	}
-	if n < 100 {
-		cleanup()
-		return "", nil, fmt.Errorf("PDF too small (likely invalid)")
-	}
-
-	// Validate PDF magic bytes — catches R2 XML errors, HTML pages, etc.
-	if err := validatePDFMagic(outPath); err != nil {
-		cleanup()
-		return "", nil, err
-	}
-
-	return outPath, cleanup, nil
 }

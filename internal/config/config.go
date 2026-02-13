@@ -16,10 +16,16 @@ type Config struct {
 	InternalSharedSecret string
 	MistralAPIKey        string
 	OpenRouterAPIKey     string
+	GroqAPIKey           string
 
 	// Limits
 	MaxJSONBodyBytes int64
 	MaxPDFBytes      int64
+	MaxFileBytes     int64
+	MaxAudioBytes    int64
+	MaxVideoBytes    int64
+	MaxCodeFileBytes int64
+	MaxImageBytes    int64
 
 	// Concurrency
 	MaxConcurrentRequests int64
@@ -33,12 +39,11 @@ type Config struct {
 	IdleTimeout       time.Duration
 
 	// Request timeouts
-	ExtractTimeout      time.Duration
-	PreviewTimeout      time.Duration
-	ImageExtractTimeout time.Duration
+	UniversalExtractTimeout time.Duration
 
 	// Download
 	DownloadTimeout time.Duration
+	GroqTimeout     time.Duration
 
 	// Poppler / extraction timeouts
 	PDFInfoTimeout      time.Duration
@@ -57,7 +62,6 @@ type Config struct {
 
 	// http
 	MaxHeaderBytes int
-	MaxImageURLLen int
 
 	// Hybrid defaults (used when request options omit values)
 	DefaultMinWordsThreshold    int
@@ -71,6 +75,16 @@ type Config struct {
 	// Vision (OpenRouter) defaults
 	DefaultVisionModel   string
 	VisionRequestTimeout time.Duration
+
+	// Groq transcription
+	GroqAPIURL string
+	GroqModel  string
+
+	// Conversion binaries
+	LibreOfficeTimeout time.Duration
+	LibreOfficeBinary  string
+	FFmpegTimeout      time.Duration
+	FFmpegBinary       string
 }
 
 func Load() Config {
@@ -80,9 +94,15 @@ func Load() Config {
 		InternalSharedSecret: envStr("INTERNAL_SHARED_SECRET", ""),
 		MistralAPIKey:        envStr("MISTRAL_API_KEY", ""),
 		OpenRouterAPIKey:     envStr("OPENROUTER_API_KEY", ""),
+		GroqAPIKey:           envStr("GROQ_API_KEY", ""),
 
 		MaxJSONBodyBytes: int64(envInt("MAX_JSON_BODY_BYTES", 2<<20)),
 		MaxPDFBytes:      int64(envInt("MAX_PDF_BYTES", int(200<<20))),
+		MaxFileBytes:     int64(envInt("MAX_FILE_BYTES", int(500<<20))),
+		MaxAudioBytes:    int64(envInt("MAX_AUDIO_BYTES", int(100<<20))),
+		MaxVideoBytes:    int64(envInt("MAX_VIDEO_BYTES", int(500<<20))),
+		MaxCodeFileBytes: int64(envInt("MAX_CODE_FILE_BYTES", int(10<<20))),
+		MaxImageBytes:    int64(envInt("MAX_IMAGE_BYTES", int(40<<20))),
 
 		MaxConcurrentRequests: int64(envInt("MAX_CONCURRENT_REQUESTS", 15)),
 		MaxOCRConcurrent:      int64(envInt("MAX_OCR_CONCURRENT", 3)),
@@ -93,11 +113,10 @@ func Load() Config {
 		WriteTimeout:      envDur("WRITE_TIMEOUT", 180*time.Second),
 		IdleTimeout:       envDur("IDLE_TIMEOUT", 60*time.Second),
 
-		ExtractTimeout:      envDur("EXTRACT_TIMEOUT", 160*time.Second),
-		PreviewTimeout:      envDur("PREVIEW_TIMEOUT", 60*time.Second),
-		ImageExtractTimeout: envDur("IMAGE_EXTRACT_TIMEOUT", 120*time.Second),
+		UniversalExtractTimeout: envDur("UNIVERSAL_EXTRACT_TIMEOUT", 300*time.Second),
 
 		DownloadTimeout: envDur("DOWNLOAD_TIMEOUT", 25*time.Second),
+		GroqTimeout:     envDur("GROQ_TIMEOUT", 120*time.Second),
 
 		PDFInfoTimeout:      envDur("PDFINFO_TIMEOUT", 5*time.Second),
 		PDFToTextTimeout:    envDur("PDFTOTEXT_TIMEOUT", 10*time.Second),
@@ -111,7 +130,6 @@ func Load() Config {
 		HealthDegradeRatio: envFloat("HEALTH_DEGRADE_RATIO", 0.9),
 
 		MaxHeaderBytes: envInt("MAX_HEADER_BYTES", 1<<20),
-		MaxImageURLLen: envInt("MAX_IMAGE_URL_LEN", 2048),
 
 		DefaultMinWordsThreshold:    envInt("DEFAULT_MIN_WORDS", 20),
 		DefaultOCRTriggerRatio:      envFloat("DEFAULT_OCR_TRIGGER_RATIO", 0.25),
@@ -123,6 +141,14 @@ func Load() Config {
 
 		DefaultVisionModel:   envStr("DEFAULT_VISION_MODEL", "mistralai/mistral-small-3.1-24b-instruct"),
 		VisionRequestTimeout: envDur("VISION_REQUEST_TIMEOUT", 30*time.Second),
+
+		GroqAPIURL: envStr("GROQ_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions"),
+		GroqModel:  envStr("GROQ_MODEL", "whisper-large-v3-turbo"),
+
+		LibreOfficeTimeout: envDur("LIBREOFFICE_TIMEOUT", 60*time.Second),
+		LibreOfficeBinary:  envStr("LIBREOFFICE_BINARY", "soffice"),
+		FFmpegTimeout:      envDur("FFMPEG_TIMEOUT", 120*time.Second),
+		FFmpegBinary:       envStr("FFMPEG_BINARY", "ffmpeg"),
 	}
 }
 

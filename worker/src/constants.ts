@@ -1,8 +1,7 @@
 export const ROUTES = {
   HEALTH: "/health",
-  PREVIEW: "/api/pdf/preview",
-  EXTRACT: "/api/pdf/extract",
-  IMAGE_EXTRACT: "/api/image/extract",
+  PREVIEW: "/api/preview",
+  EXTRACT: "/api/extract",
   FILE_PRESIGN: "/api/file/presign",
 } as const;
 
@@ -11,9 +10,8 @@ export const CONTAINER = {
   PORT: 8080,
 
   HEALTH_URL: "http://container/health",
-  PREVIEW_URL: "http://container/pdf/preview",
-  EXTRACT_URL: "http://container/pdf/extract",
-  IMAGE_EXTRACT_URL: "http://container/image/extract",
+  PREVIEW_URL: "http://container/preview",
+  EXTRACT_URL: "http://container/extract",
 
   START_TIMEOUT_MS: 30_000,
   HEALTH_TIMEOUT_MS: 5_000,
