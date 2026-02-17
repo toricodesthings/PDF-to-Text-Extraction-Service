@@ -237,12 +237,12 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUniversalExtract(w http.ResponseWriter, r *http.Request) {
-	ct := r.Header.Get("Content-Type")
-
-	// Binary upload path — Worker streamed the R2 object directly
-	if ct != "" && !strings.HasPrefix(ct, "application/json") {
-		fileName := r.Header.Get("X-File-Name")
-		if fileName == "" {
+	// Binary upload path — Worker streamed the R2 object directly.
+	// Detect via X-File-Name header (set only on the binary stream path);
+	// Content-Type alone is unreliable because the container proxy may strip it.
+	fileName := r.Header.Get("X-File-Name")
+	if fileName != "" {
+		if strings.TrimSpace(fileName) == "" {
 			fileName = "input.bin"
 		}
 
@@ -335,7 +335,6 @@ func handleUniversalExtract(w http.ResponseWriter, r *http.Request) {
 
 func handlePreview(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	ct := r.Header.Get("Content-Type")
 
 	var (
 		dl       extract.DownloadedFile
@@ -343,10 +342,11 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		options  map[string]any
 	)
 
-	// Binary upload path — Worker streamed the R2 object directly
-	if ct != "" && !strings.HasPrefix(ct, "application/json") {
-		fileName = r.Header.Get("X-File-Name")
-		if fileName == "" {
+	// Binary upload path — Worker streamed the R2 object directly.
+	// Detect via X-File-Name header (set only on the binary stream path).
+	fileName = r.Header.Get("X-File-Name")
+	if fileName != "" {
+		if strings.TrimSpace(fileName) == "" {
 			fileName = "input.bin"
 		}
 

@@ -6,6 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/fileproc ./cmd/server
 
 FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends --no-install-suggests \
     poppler-utils \
     ca-certificates \
