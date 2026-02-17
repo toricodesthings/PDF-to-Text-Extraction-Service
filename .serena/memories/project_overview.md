@@ -1,0 +1,13 @@
+# File Processing Service Overview
+- Purpose: Universal file-to-text extraction service for RAG ingestion.
+- Runtime architecture:
+  - Cloudflare Worker in `worker/src/index.ts` (public endpoints, presign/key validation, rate-limit, container lifecycle/proxy).
+  - Go container server in `cmd/server/main.go` (internal routes `/extract` and `/preview`, download temp files, MIME/extension routing, extractor invocation).
+- Core extraction packages:
+  - `internal/extract`: registry/router/job/result/download utilities.
+  - `internal/extractors/*`: file-family specific extractors.
+  - `internal/ocr`, `internal/vision`, `internal/transcribe`, `internal/hybrid`, `internal/image` for external AI-assisted extraction.
+- Main docs:
+  - `README.md` for API contracts and architecture.
+  - `docs/UPGRADE_PLAN.md` for historical design plan and package intent.
+- Tech stack: Go 1.25.x container service + Cloudflare Worker (TypeScript, Wrangler, `@cloudflare/containers`).

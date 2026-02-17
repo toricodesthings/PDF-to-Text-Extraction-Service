@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --port 3069 --config wrangler.jsonc --env dev",
     "deploy": "wrangler deploy"
   },
   "dependencies": {

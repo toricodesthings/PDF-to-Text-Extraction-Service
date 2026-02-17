@@ -92,31 +92,33 @@ func RunMistralOCR(ctx context.Context, presignedURL string, model string, pages
 		return OCRResponse{}, fmt.Errorf("marshal: %w", err)
 	}
 
-	// Retry logic
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return OCRResponse{}, ctx.Err()
-			case <-time.After(retryDelay * time.Duration(attempt)):
+	return withConcurrencyLimit(ctx, func() (OCRResponse, error) {
+		// Retry logic
+		var lastErr error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					return OCRResponse{}, ctx.Err()
+				case <-time.After(retryDelay * time.Duration(attempt)):
+				}
+			}
+
+			result, err := executeOCRRequest(ctx, key, bodyBytes)
+			if err == nil {
+				return result, nil
+			}
+
+			lastErr = err
+
+			// Don't retry client errors (4xx)
+			if isClientError(err) {
+				break
 			}
 		}
 
-		result, err := executeOCRRequest(ctx, key, bodyBytes)
-		if err == nil {
-			return result, nil
-		}
-
-		lastErr = err
-
-		// Don't retry client errors (4xx)
-		if isClientError(err) {
-			break
-		}
-	}
-
-	return OCRResponse{}, fmt.Errorf("OCR failed after %d attempts: %w", maxRetries+1, lastErr)
+		return OCRResponse{}, fmt.Errorf("OCR failed after %d attempts: %w", maxRetries+1, lastErr)
+	})
 }
 
 func executeOCRRequest(ctx context.Context, apiKey string, bodyBytes []byte) (OCRResponse, error) {
@@ -258,28 +260,30 @@ func RunMistralImageOCR(ctx context.Context, imageURL string, model string) (OCR
 		return OCRResponse{}, fmt.Errorf("marshal: %w", err)
 	}
 
-	// Retry logic (same as PDF variant)
-	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return OCRResponse{}, ctx.Err()
-			case <-time.After(retryDelay * time.Duration(attempt)):
+	return withConcurrencyLimit(ctx, func() (OCRResponse, error) {
+		// Retry logic (same as PDF variant)
+		var lastErr error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					return OCRResponse{}, ctx.Err()
+				case <-time.After(retryDelay * time.Duration(attempt)):
+				}
+			}
+
+			result, err := executeOCRRequest(ctx, key, bodyBytes)
+			if err == nil {
+				return result, nil
+			}
+
+			lastErr = err
+
+			if isClientError(err) {
+				break
 			}
 		}
 
-		result, err := executeOCRRequest(ctx, key, bodyBytes)
-		if err == nil {
-			return result, nil
-		}
-
-		lastErr = err
-
-		if isClientError(err) {
-			break
-		}
-	}
-
-	return OCRResponse{}, fmt.Errorf("image OCR failed after %d attempts: %w", maxRetries+1, lastErr)
+		return OCRResponse{}, fmt.Errorf("image OCR failed after %d attempts: %w", maxRetries+1, lastErr)
+	})
 }

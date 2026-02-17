@@ -15,6 +15,11 @@ type DOCXExtractor struct {
 	maxBytes int64
 }
 
+const (
+	defaultMaxZipEntryBytes    int64 = 32 << 20
+	defaultMaxZipMetadataBytes int64 = 2 << 20
+)
+
 func NewDOCX(maxBytes int64) *DOCXExtractor {
 	return &DOCXExtractor{maxBytes: maxBytes}
 }
@@ -40,14 +45,14 @@ func (e *DOCXExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 	}
 	defer zr.Close()
 
-	body, err := readZipFile(&zr.Reader, "word/document.xml")
+	body, err := readZipFile(&zr.Reader, "word/document.xml", defaultMaxZipEntryBytes)
 	if err != nil {
 		msg := err.Error()
 		return extract.Result{Success: false, FileType: e.Name(), MIMEType: job.MIMEType, Error: &msg}, err
 	}
 
 	text := docxToMarkdown(body)
-	meta := parseCoreMetadata(&zr.Reader)
+	meta := parseCoreMetadata(&zr.Reader, defaultMaxZipMetadataBytes)
 
 	// Prepend metadata frontmatter if available
 	if len(meta) > 0 {
@@ -312,24 +317,39 @@ func readCharData(dec *xml.Decoder, depth *int) string {
 
 // --- Shared helpers ---
 
-func readZipFile(zr *zip.Reader, name string) ([]byte, error) {
+func readZipFile(zr *zip.Reader, name string, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxZipEntryBytes
+	}
 	for _, f := range zr.File {
 		if f.Name != name {
 			continue
+		}
+		if f.UncompressedSize64 > uint64(maxBytes) {
+			return nil, fmt.Errorf("%s exceeds %dMB uncompressed limit", name, maxBytes/(1<<20))
 		}
 		rc, err := f.Open()
 		if err != nil {
 			return nil, err
 		}
 		defer rc.Close()
-		return io.ReadAll(rc)
+
+		lr := &io.LimitedReader{R: rc, N: maxBytes + 1}
+		b, err := io.ReadAll(lr)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(b)) > maxBytes {
+			return nil, fmt.Errorf("%s exceeds %dMB uncompressed limit", name, maxBytes/(1<<20))
+		}
+		return b, nil
 	}
 	return nil, fmt.Errorf("missing %s", name)
 }
 
 // parseCoreMetadata extracts title, author, dates from docProps/core.xml.
-func parseCoreMetadata(zr *zip.Reader) map[string]string {
-	b, err := readZipFile(zr, "docProps/core.xml")
+func parseCoreMetadata(zr *zip.Reader, maxBytes int64) map[string]string {
+	b, err := readZipFile(zr, "docProps/core.xml", maxBytes)
 	if err != nil {
 		return nil
 	}

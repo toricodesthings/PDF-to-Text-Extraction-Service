@@ -53,7 +53,7 @@ func (e *EPUBExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 	var spineItems []string
 
 	if opfPath != "" {
-		opfData, err := readZipEntry(zr, opfPath)
+		opfData, err := readZipEntry(zr, opfPath, 4<<20)
 		if err == nil {
 			spineItems, meta = parseOPF(opfData, path.Dir(opfPath))
 		}
@@ -71,7 +71,7 @@ func (e *EPUBExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 
 	var chapters []string
 	for i, item := range spineItems {
-		b, err := readZipEntry(zr, item)
+		b, err := readZipEntry(zr, item, 16<<20)
 		if err != nil {
 			continue
 		}
@@ -95,7 +95,7 @@ func (e *EPUBExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 
 // findOPFPath reads META-INF/container.xml and returns the rootfile full-path.
 func findOPFPath(zr *zip.ReadCloser) string {
-	b, err := readZipEntry(zr, "META-INF/container.xml")
+	b, err := readZipEntry(zr, "META-INF/container.xml", 2<<20)
 	if err != nil {
 		return ""
 	}
@@ -260,15 +260,26 @@ func epubStripHTML(s string) string {
 	return strings.Join(out, "\n\n")
 }
 
-func readZipEntry(zr *zip.ReadCloser, name string) ([]byte, error) {
+func readZipEntry(zr *zip.ReadCloser, name string, maxBytes int64) ([]byte, error) {
 	for _, f := range zr.File {
 		if f.Name == name {
+			if f.UncompressedSize64 > uint64(maxBytes) {
+				return nil, fmt.Errorf("%s exceeds %dMB uncompressed limit", name, maxBytes/(1<<20))
+			}
 			rc, err := f.Open()
 			if err != nil {
 				return nil, err
 			}
 			defer rc.Close()
-			return io.ReadAll(rc)
+			lr := &io.LimitedReader{R: rc, N: maxBytes + 1}
+			b, err := io.ReadAll(lr)
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(b)) > maxBytes {
+				return nil, fmt.Errorf("%s exceeds %dMB uncompressed limit", name, maxBytes/(1<<20))
+			}
+			return b, nil
 		}
 	}
 	return nil, fmt.Errorf("not found: %s", name)

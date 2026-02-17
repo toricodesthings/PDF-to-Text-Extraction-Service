@@ -50,7 +50,7 @@ func (e *PPTXExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 	}
 	sort.Strings(slideNames)
 
-	meta := parseCoreMetadata(&zr.Reader)
+	meta := parseCoreMetadata(&zr.Reader, defaultMaxZipMetadataBytes)
 	if meta == nil {
 		meta = map[string]string{}
 	}
@@ -63,7 +63,7 @@ func (e *PPTXExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 		sb.WriteString(fmt.Sprintf("## Slide %d", slideNum))
 
 		// Extract slide body text
-		b, err := readZipFile(&zr.Reader, name)
+		b, err := readZipFile(&zr.Reader, name, defaultMaxZipEntryBytes)
 		if err != nil {
 			continue
 		}
@@ -74,7 +74,7 @@ func (e *PPTXExtractor) Extract(ctx context.Context, job extract.Job) (extract.R
 
 		// Extract speaker notes from ppt/notesSlides/notesSlideN.xml
 		notesPath := fmt.Sprintf("ppt/notesSlides/notesSlide%d.xml", slideNum)
-		if nb, err := readZipFile(&zr.Reader, notesPath); err == nil {
+		if nb, err := readZipFile(&zr.Reader, notesPath, defaultMaxZipEntryBytes); err == nil {
 			notesText := pptxExtractTextBlocks(nb)
 			// Filter out the slide number placeholder text that's often in notes
 			notesText = strings.TrimSpace(notesText)

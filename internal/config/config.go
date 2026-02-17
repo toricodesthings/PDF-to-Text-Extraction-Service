@@ -85,6 +85,10 @@ type Config struct {
 	LibreOfficeBinary  string
 	FFmpegTimeout      time.Duration
 	FFmpegBinary       string
+
+	// Security
+	AllowedPresignedHostSuffixes []string
+	AllowPrivateDownloadURLs     bool
 }
 
 func Load() Config {
@@ -149,6 +153,12 @@ func Load() Config {
 		LibreOfficeBinary:  envStr("LIBREOFFICE_BINARY", "soffice"),
 		FFmpegTimeout:      envDur("FFMPEG_TIMEOUT", 120*time.Second),
 		FFmpegBinary:       envStr("FFMPEG_BINARY", "ffmpeg"),
+
+		AllowedPresignedHostSuffixes: envCSV("ALLOWED_PRESIGNED_HOST_SUFFIXES", []string{
+			".r2.cloudflarestorage.com",
+			".r2.dev",
+		}),
+		AllowPrivateDownloadURLs: envBool("ALLOW_PRIVATE_DOWNLOAD_URLS", false),
 	}
 }
 
@@ -201,4 +211,39 @@ func envDur(key string, fallback time.Duration) time.Duration {
 		return fallback
 	}
 	return d
+}
+
+func envCSV(key string, fallback []string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return append([]string(nil), fallback...)
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	if len(out) == 0 {
+		return append([]string(nil), fallback...)
+	}
+	return out
+}
+
+func envBool(key string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }

@@ -38,20 +38,8 @@ func (e *Extractor) Extract(ctx context.Context, job extract.Job) (extract.Resul
 	}
 	defer zr.Close()
 
-	var content []byte
-	for _, f := range zr.File {
-		if f.Name == "content.xml" {
-			rc, err := f.Open()
-			if err != nil {
-				continue
-			}
-			content, _ = io.ReadAll(rc)
-			rc.Close()
-			break
-		}
-	}
-	if len(content) == 0 {
-		err = fmt.Errorf("content.xml not found")
+	content, err := readZipEntryLimited(&zr.Reader, "content.xml", 32<<20)
+	if err != nil {
 		msg := err.Error()
 		return extract.Result{Success: false, FileType: e.Name(), MIMEType: job.MIMEType, Error: &msg}, err
 	}
@@ -291,12 +279,10 @@ func odfParseMetadata(zr *zip.ReadCloser) map[string]string {
 		if f.Name != "meta.xml" {
 			continue
 		}
-		rc, err := f.Open()
+		b, err := readZipEntryLimited(&zr.Reader, "meta.xml", 2<<20)
 		if err != nil {
 			return nil
 		}
-		b, _ := io.ReadAll(rc)
-		rc.Close()
 
 		meta := map[string]string{}
 		dec := xml.NewDecoder(strings.NewReader(string(b)))
@@ -338,6 +324,33 @@ func odfParseMetadata(zr *zip.ReadCloser) map[string]string {
 		return meta
 	}
 	return nil
+}
+
+func readZipEntryLimited(zr *zip.Reader, name string, maxBytes int64) ([]byte, error) {
+	for _, f := range zr.File {
+		if f.Name != name {
+			continue
+		}
+		if f.UncompressedSize64 > uint64(maxBytes) {
+			return nil, fmt.Errorf("%s exceeds %dMB uncompressed limit", name, maxBytes/(1<<20))
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+
+		lr := &io.LimitedReader{R: rc, N: maxBytes + 1}
+		b, err := io.ReadAll(lr)
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(b)) > maxBytes {
+			return nil, fmt.Errorf("%s exceeds %dMB uncompressed limit", name, maxBytes/(1<<20))
+		}
+		return b, nil
+	}
+	return nil, fmt.Errorf("%s not found", name)
 }
 
 func odfFrontmatter(meta map[string]string) string {

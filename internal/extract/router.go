@@ -13,13 +13,20 @@ type Router struct {
 	registry        *Registry
 	maxFileBytes    int64
 	downloadTimeout time.Duration
+	successHook     func(fileType string, fileSize int64, duration time.Duration)
 }
 
 func NewRouter(registry *Registry, maxFileBytes int64, downloadTimeout time.Duration) *Router {
 	return &Router{registry: registry, maxFileBytes: maxFileBytes, downloadTimeout: downloadTimeout}
 }
 
+func (r *Router) SetSuccessHook(hook func(fileType string, fileSize int64, duration time.Duration)) {
+	r.successHook = hook
+}
+
 func (r *Router) Extract(ctx context.Context, req UniversalExtractRequest) (Result, error) {
+	start := time.Now()
+
 	if strings.TrimSpace(req.PresignedURL) == "" {
 		return errResult("presignedUrl required"), fmt.Errorf("presignedUrl required")
 	}
@@ -70,11 +77,17 @@ func (r *Router) Extract(ctx context.Context, req UniversalExtractRequest) (Resu
 	}
 
 	res.Success = true
+	if strings.TrimSpace(res.FileType) == "" {
+		res.FileType = extractor.Name()
+	}
 	if res.MIMEType == "" {
 		res.MIMEType = dl.MIMEType
 	}
 	if res.CharCount == 0 && res.Text != "" {
 		res.WordCount, res.CharCount = BuildCounts(res.Text)
+	}
+	if r.successHook != nil {
+		r.successHook(res.FileType, dl.Size, time.Since(start))
 	}
 	return res, nil
 }

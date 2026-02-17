@@ -4,6 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "dev": "wrangler dev --port 3069 --config wrangler.jsonc --env dev",
     "test": "echo \"Error: no test specified\" && exit 1",
     "postinstall": "npm --prefix worker install"
   },
@@ -19,6 +20,6 @@
   },
   "homepage": "https://github.com/toricodesthings/File-to-Text-Extraction-Service#readme",
   "devDependencies": {
-    "wrangler": "^4.64.0"
+    "wrangler": "^4.65.0"
   }
 }

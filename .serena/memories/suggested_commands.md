@@ -1,0 +1,11 @@
+# Suggested Commands
+- Start worker locally:
+  - `cd worker && npm run dev`
+  - or from repo root: `npx wrangler dev`
+- Run Go container server locally:
+  - `INTERNAL_SHARED_SECRET="your-secret" go run ./cmd/server`
+- Build/test Go code:
+  - `go test ./...`
+  - `go build ./...`
+- Common Linux utilities:
+  - `ls`, `cd`, `find`, `rg`, `sed`, `cat`, `git status`, `git diff`.

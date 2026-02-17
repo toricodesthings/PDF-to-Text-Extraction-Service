@@ -9,11 +9,10 @@ export interface Env {
   INTERNAL_SHARED_SECRET: string;
   ALLOWED_PRESIGNED_HOST_SUFFIXES?: string;
   ALLOW_PRIVATE_DOWNLOAD_URLS?: string;
-  /** R2 binding — available in deployed Workers, local miniflare only has an empty bucket */
   FILE_BUCKET: R2Bucket;
   FILEPROC: { getByName(name: string): FileProcContainer };
   RATE_LIMITER: { limit(options: { key: string }): Promise<{ success: boolean }> };
-  /** S3 API credentials for aws4fetch fallback (local dev via .dev.vars) */
+  /** S3 API credentials — only needed for /api/file/presign endpoint */
   R2_ACCOUNT_ID?: string;
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;
@@ -208,20 +207,9 @@ function getStringField(body: any, name: string): string {
   return value.trim();
 }
 
-type R2PresignBucket = R2Bucket & {
-  createSignedUrl: (key: string, options: { expiresIn: number }) => Promise<string>;
-};
-
-/**
- * Check if the S3 API credentials are available (local dev via .dev.vars).
- */
-function hasS3Credentials(env: Env): boolean {
-  return Boolean(env.R2_ACCOUNT_ID && env.R2_ACCESS_KEY_ID && env.R2_SECRET_ACCESS_KEY);
-}
-
 /**
  * Generate a presigned download URL via the S3-compatible API (aws4fetch).
- * Used as fallback when the R2 binding cannot presign (local dev).
+ * Only used by the /api/file/presign endpoint for external consumers.
  */
 async function createPresignedUrlViaS3(
   env: Env,
@@ -253,44 +241,37 @@ async function createPresignedUrlViaS3(
   return signed.url;
 }
 
+// ---- File source resolution for extract/preview ----
+
+type FileSource =
+  | { type: "stream"; body: ReadableStream; fileName: string; contentType: string; size: number }
+  | { type: "url"; presignedUrl: string; fileName: string; options?: Record<string, unknown> };
+
 /**
- * Presign an R2 key.
- *
- * Strategy:
- *   1. Try the R2 binding (deployed Workers — co-located, zero latency).
- *   2. Fall back to aws4fetch S3 API (local dev — binding bucket is empty).
+ * Resolve the request body into a file source:
+ *   - key → R2 binding .get() → stream (zero-latency, no presign needed)
+ *   - presignedUrl → validated URL (backward compat)
  */
-async function createPresignedUrl(bucket: R2Bucket, key: string, expiresInSeconds: number, env: Env): Promise<string> {
-  // Attempt R2 binding first
-  try {
-    const maybe = await bucket.head(key);
-    if (maybe) {
-      const signer = (bucket as R2PresignBucket).createSignedUrl;
-      if (typeof signer === "function") {
-        return await signer.call(bucket, key, { expiresIn: expiresInSeconds });
-      }
-    }
-  } catch {
-    // Binding unavailable or failed — fall through to S3 fallback
-  }
-
-  // S3 API fallback (local dev)
-  if (hasS3Credentials(env)) {
-    return createPresignedUrlViaS3(env, key, expiresInSeconds);
-  }
-
-  throw new Error("not_found");
-}
-
-async function resolveUrl(body: any, bucket: R2Bucket, env: Env): Promise<string> {
-  // Prefer R2 key — the Worker has a direct R2 binding so presigning
-  // is co-located and instant.  S3 API is a fallback for local dev.
+async function resolveFileSource(body: any, bucket: R2Bucket, env: Env): Promise<FileSource> {
   const key = getStringField(body, "key");
   if (key) {
     if (!isAllowedR2Key(key)) {
       throw new Error("invalid_key");
     }
-    return createPresignedUrl(bucket, key, 600, env);
+
+    const object = await bucket.get(key);
+    if (!object) {
+      throw new Error("not_found");
+    }
+
+    const fileName = getStringField(body, "fileName") || key.split("/").pop() || "file";
+    return {
+      type: "stream",
+      body: object.body,
+      fileName,
+      contentType: object.httpMetadata?.contentType || "application/octet-stream",
+      size: object.size,
+    };
   }
 
   const presignedUrl = getStringField(body, "presignedUrl");
@@ -300,10 +281,56 @@ async function resolveUrl(body: any, bucket: R2Bucket, env: Env): Promise<string
     if (!isAllowedPresignedUrl(presignedUrl, allowedSuffixes, allowPrivate)) {
       throw new Error("invalid_presigned_url");
     }
-    return presignedUrl;
+    return {
+      type: "url",
+      presignedUrl,
+      fileName: getStringField(body, "fileName") || "file",
+      options: body.options,
+    };
   }
 
   throw new Error("missing_presigned_or_key");
+}
+
+/**
+ * Build the request to forward to the container based on the file source.
+ *   - stream: binary body + metadata in headers (no download round-trip)
+ *   - url: JSON body with presignedUrl (container downloads)
+ */
+function buildContainerRequest(
+  containerUrl: string,
+  source: FileSource,
+  auth: string,
+  clientId: string
+): Request {
+  if (source.type === "stream") {
+    return new Request(containerUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": source.contentType,
+        "Content-Length": String(source.size),
+        "X-File-Name": source.fileName,
+        "X-Internal-Auth": auth,
+        "X-Forwarded-For": clientId,
+      },
+      body: source.body,
+    });
+  }
+
+  // URL path — backward compat JSON body
+  return new Request(containerUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Internal-Auth": auth,
+      "X-Forwarded-For": clientId,
+    },
+    body: JSON.stringify({
+      presignedUrl: source.presignedUrl,
+      fileName: source.fileName,
+      options: source.options,
+    }),
+  });
 }
 
 async function parseJSONBody(req: Request, maxBytes = LIMITS.JSON_BODY_MAX_BYTES): Promise<any> {
@@ -354,8 +381,9 @@ export default {
         }
 
         const body = await parseJSONBody(req);
+        let source: FileSource;
         try {
-          body.presignedUrl = await resolveUrl(body, env.FILE_BUCKET, env);
+          source = await resolveFileSource(body, env.FILE_BUCKET, env);
         } catch (err: any) {
           if (err?.message === "invalid_key") {
             return json({ success: false, error: "Invalid key", code: "bad_request" }, { status: 400 });
@@ -371,21 +399,15 @@ export default {
             { status: 400 }
           );
         }
-        // key was consumed by resolveUrl — strip before forwarding to container
-        delete body.key;
 
         const inst = await getReadyInstance(env);
-        const resp = await inst.fetch(
-          new Request(CONTAINER.PREVIEW_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Internal-Auth": env.INTERNAL_SHARED_SECRET,
-              "X-Forwarded-For": clientId,
-            },
-            body: JSON.stringify(body),
-          })
+        const containerReq = buildContainerRequest(
+          CONTAINER.PREVIEW_URL,
+          source,
+          env.INTERNAL_SHARED_SECRET,
+          clientId
         );
+        const resp = await inst.fetch(containerReq);
 
         if (!resp.ok) {
           console.error("preview container response not ok", {
@@ -410,8 +432,9 @@ export default {
         }
 
         const body = await parseJSONBody(req);
+        let source: FileSource;
         try {
-          body.presignedUrl = await resolveUrl(body, env.FILE_BUCKET, env);
+          source = await resolveFileSource(body, env.FILE_BUCKET, env);
         } catch (err: any) {
           if (err?.message === "invalid_key") {
             return json({ success: false, error: "Invalid key", code: "bad_request" }, { status: 400 });
@@ -427,21 +450,15 @@ export default {
             { status: 400 }
           );
         }
-        // key was consumed by resolveUrl — strip before forwarding to container
-        delete body.key;
 
         const inst = await getReadyInstance(env);
-        const resp = await inst.fetch(
-          new Request(CONTAINER.EXTRACT_URL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Internal-Auth": env.INTERNAL_SHARED_SECRET,
-              "X-Forwarded-For": clientId,
-            },
-            body: JSON.stringify(body),
-          })
+        const containerReq = buildContainerRequest(
+          CONTAINER.EXTRACT_URL,
+          source,
+          env.INTERNAL_SHARED_SECRET,
+          clientId
         );
+        const resp = await inst.fetch(containerReq);
 
         if (!resp.ok) {
           console.error("extract container response not ok", {
@@ -475,7 +492,12 @@ export default {
         const expiresIn = Number.isFinite(rawExpires) ? Math.max(60, Math.min(3600, rawExpires)) : 600;
 
         try {
-          const presignedUrl = await createPresignedUrl(env.FILE_BUCKET, key, expiresIn, env);
+          // Verify object exists via R2 binding, then presign via S3 API
+          const headResult = await env.FILE_BUCKET.head(key);
+          if (!headResult) {
+            return json({ success: false, error: "Not found", code: "not_found" }, { status: 404 });
+          }
+          const presignedUrl = await createPresignedUrlViaS3(env, key, expiresIn);
           return json({ success: true, presignedUrl }, { status: 200 });
         } catch (err: any) {
           if (err?.message === "not_found") {
@@ -483,7 +505,7 @@ export default {
           }
           if (err?.message === "presign_unsupported") {
             return json(
-              { success: false, error: "Presign not supported", code: "internal_error" },
+              { success: false, error: "Presign not supported — missing S3 credentials", code: "internal_error" },
               { status: 500 }
             );
           }

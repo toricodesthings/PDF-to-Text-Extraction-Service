@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,6 +32,7 @@ import (
 	structuredextractor "github.com/toricodesthings/file-processing-service/internal/extractors/structured"
 	videoextractor "github.com/toricodesthings/file-processing-service/internal/extractors/video"
 	"github.com/toricodesthings/file-processing-service/internal/hybrid"
+	"github.com/toricodesthings/file-processing-service/internal/ocr"
 	"github.com/toricodesthings/file-processing-service/internal/types"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
@@ -39,7 +42,6 @@ var (
 	cfg config.Config
 
 	requestSem *semaphore.Weighted
-	ocrSem     *semaphore.Weighted
 	extractRt  *extract.Router
 	extractReg *extract.Registry
 	hybridProc *hybrid.Processor
@@ -48,6 +50,10 @@ var (
 	limiters = &sync.Map{}
 
 	metrics = &serverMetrics{}
+
+	extractionLogger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 )
 
 type serverMetrics struct {
@@ -80,7 +86,7 @@ func main() {
 	}
 
 	requestSem = semaphore.NewWeighted(cfg.MaxConcurrentRequests)
-	ocrSem = semaphore.NewWeighted(cfg.MaxOCRConcurrent)
+	ocr.SetConcurrencyLimit(cfg.MaxOCRConcurrent)
 
 	processor := hybrid.New(cfg)
 	hybridProc = processor
@@ -112,6 +118,7 @@ func main() {
 	registry.Register(videoextractor.New(cfg.FFmpegBinary, cfg.FFmpegTimeout, audioX, cfg.MaxVideoBytes))
 
 	extractRt = extract.NewRouter(registry, cfg.MaxFileBytes, cfg.DownloadTimeout)
+	extractRt.SetSuccessHook(logExtractionSuccess)
 
 	mux := http.NewServeMux()
 
@@ -230,6 +237,75 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUniversalExtract(w http.ResponseWriter, r *http.Request) {
+	ct := r.Header.Get("Content-Type")
+
+	// Binary upload path — Worker streamed the R2 object directly
+	if ct != "" && !strings.HasPrefix(ct, "application/json") {
+		fileName := r.Header.Get("X-File-Name")
+		if fileName == "" {
+			fileName = "input.bin"
+		}
+
+		dl, err := extract.SaveBodyToTemp(r.Body, fileName, cfg.MaxFileBytes)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
+			return
+		}
+		defer dl.Cleanup()
+
+		ext := strings.ToLower(filepath.Ext(fileName))
+		extractor, err := extractReg.Resolve(dl.MIMEType, ext)
+		if err != nil {
+			msg := sanitizeError(err)
+			writeJSON(w, http.StatusBadRequest, extract.Result{Success: false, MIMEType: dl.MIMEType, FileType: "unknown", Error: &msg})
+			return
+		}
+
+		if max := extractor.MaxFileSize(); max > 0 && dl.Size > max {
+			msg := fmt.Sprintf("file exceeds extractor limit (%dMB)", max/(1<<20))
+			writeJSON(w, http.StatusBadRequest, extract.Result{Success: false, MIMEType: dl.MIMEType, FileType: extractor.Name(), Error: &msg})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.UniversalExtractTimeout)
+		defer cancel()
+
+		job := extract.Job{
+			LocalPath: dl.Path,
+			FileName:  fileName,
+			MIMEType:  dl.MIMEType,
+			FileSize:  dl.Size,
+		}
+
+		res, err := extractor.Extract(ctx, job)
+		if err != nil {
+			if res.Error == nil {
+				msg := sanitizeError(err)
+				res.Error = &msg
+			}
+			res.Success = false
+			if res.MIMEType == "" {
+				res.MIMEType = dl.MIMEType
+			}
+			writeJSON(w, http.StatusBadRequest, res)
+			return
+		}
+
+		res.Success = true
+		if strings.TrimSpace(res.FileType) == "" {
+			res.FileType = extractor.Name()
+		}
+		if res.MIMEType == "" {
+			res.MIMEType = dl.MIMEType
+		}
+		if res.CharCount == 0 && res.Text != "" {
+			res.WordCount, res.CharCount = extract.BuildCounts(res.Text)
+		}
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+
+	// JSON path — presignedUrl download (backward compat)
 	req, err := parseJSON[extract.UniversalExtractRequest](r, cfg.MaxJSONBodyBytes)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
@@ -238,6 +314,10 @@ func handleUniversalExtract(w http.ResponseWriter, r *http.Request) {
 
 	if strings.TrimSpace(req.PresignedURL) == "" {
 		writeErr(w, http.StatusBadRequest, "validation_failed", "presignedUrl required")
+		return
+	}
+	if err := validatePresignedURL(req.PresignedURL, cfg.AllowedPresignedHostSuffixes, cfg.AllowPrivateDownloadURLs); err != nil {
+		writeErr(w, http.StatusBadRequest, "validation_failed", sanitizeError(err))
 		return
 	}
 
@@ -254,29 +334,59 @@ func handleUniversalExtract(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePreview(w http.ResponseWriter, r *http.Request) {
-	req, err := parseJSON[extract.UniversalExtractRequest](r, cfg.MaxJSONBodyBytes)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
-		return
-	}
+	start := time.Now()
+	ct := r.Header.Get("Content-Type")
 
-	if strings.TrimSpace(req.PresignedURL) == "" {
-		writeErr(w, http.StatusBadRequest, "validation_failed", "presignedUrl required")
-		return
-	}
+	var (
+		dl       extract.DownloadedFile
+		fileName string
+		options  map[string]any
+	)
 
-	ctx, cancel := context.WithTimeout(r.Context(), cfg.UniversalExtractTimeout)
-	defer cancel()
+	// Binary upload path — Worker streamed the R2 object directly
+	if ct != "" && !strings.HasPrefix(ct, "application/json") {
+		fileName = r.Header.Get("X-File-Name")
+		if fileName == "" {
+			fileName = "input.bin"
+		}
 
-	fileName := strings.TrimSpace(req.FileName)
-	if fileName == "" {
-		fileName = "input.bin"
-	}
+		var err error
+		dl, err = extract.SaveBodyToTemp(r.Body, fileName, cfg.MaxFileBytes)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": sanitizeError(err)})
+			return
+		}
+	} else {
+		// JSON path — presignedUrl download (backward compat)
+		req, err := parseJSON[extract.UniversalExtractRequest](r, cfg.MaxJSONBodyBytes)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_request", sanitizeError(err))
+			return
+		}
 
-	dl, err := extract.DownloadToTemp(ctx, req.PresignedURL, fileName, cfg.MaxFileBytes, cfg.DownloadTimeout)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": sanitizeError(err)})
-		return
+		if strings.TrimSpace(req.PresignedURL) == "" {
+			writeErr(w, http.StatusBadRequest, "validation_failed", "presignedUrl required")
+			return
+		}
+		if err := validatePresignedURL(req.PresignedURL, cfg.AllowedPresignedHostSuffixes, cfg.AllowPrivateDownloadURLs); err != nil {
+			writeErr(w, http.StatusBadRequest, "validation_failed", sanitizeError(err))
+			return
+		}
+
+		fileName = strings.TrimSpace(req.FileName)
+		if fileName == "" {
+			fileName = "input.bin"
+		}
+		options = req.Options
+
+		dlCtx, dlCancel := context.WithTimeout(r.Context(), cfg.DownloadTimeout)
+		defer dlCancel()
+
+		dl, err = extract.DownloadToTemp(dlCtx, req.PresignedURL, fileName, cfg.MaxFileBytes, cfg.DownloadTimeout)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"success": false, "error": sanitizeError(err)})
+			return
+		}
 	}
 	defer dl.Cleanup()
 
@@ -294,14 +404,17 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	previewMaxChars := previewMaxCharsOption(req.Options, cfg.DefaultPreviewMaxChars)
+	previewMaxChars := previewMaxCharsOption(options, cfg.DefaultPreviewMaxChars)
+
+	ctx, cancel := context.WithTimeout(r.Context(), cfg.UniversalExtractTimeout)
+	defer cancel()
 
 	if extractor.Name() == "document/pdf" {
 		opts := hybridProc.ApplyDefaults(types.HybridProcessorOptions{})
-		if req.Options != nil {
-			opts.PreviewMaxPages = intOption(req.Options, "previewMaxPages", opts.PreviewMaxPages)
-			opts.PreviewMaxChars = intOption(req.Options, "previewMaxChars", opts.PreviewMaxChars)
-			opts.MinWordsThreshold = intOption(req.Options, "minWordsThreshold", opts.MinWordsThreshold)
+		if options != nil {
+			opts.PreviewMaxPages = intOption(options, "previewMaxPages", opts.PreviewMaxPages)
+			opts.PreviewMaxChars = intOption(options, "previewMaxChars", opts.PreviewMaxChars)
+			opts.MinWordsThreshold = intOption(options, "minWordsThreshold", opts.MinWordsThreshold)
 		}
 		prev := hybridProc.ProcessPreview(ctx, dl.Path, opts)
 		if prev.Error != nil {
@@ -328,16 +441,16 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 			WordCount: wcount,
 			CharCount: ccount,
 		})
+		logExtractionSuccess("document/pdf", dl.Size, time.Since(start))
 		return
 	}
 
 	job := extract.Job{
-		PresignedURL: req.PresignedURL,
-		LocalPath:    dl.Path,
-		FileName:     fileName,
-		MIMEType:     dl.MIMEType,
-		FileSize:     dl.Size,
-		Options:      req.Options,
+		LocalPath: dl.Path,
+		FileName:  fileName,
+		MIMEType:  dl.MIMEType,
+		FileSize:  dl.Size,
+		Options:   options,
 	}
 
 	res, err := extractor.Extract(ctx, job)
@@ -362,6 +475,10 @@ func handlePreview(w http.ResponseWriter, r *http.Request) {
 	if res.MIMEType == "" {
 		res.MIMEType = dl.MIMEType
 	}
+	if strings.TrimSpace(res.FileType) == "" {
+		res.FileType = extractor.Name()
+	}
+	logExtractionSuccess(res.FileType, dl.Size, time.Since(start))
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -509,6 +626,80 @@ func sanitizeLogString(s string) string {
 	return s
 }
 
+func validatePresignedURL(raw string, allowedHostSuffixes []string, allowPrivate bool) error {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil {
+		return fmt.Errorf("invalid presignedUrl")
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return fmt.Errorf("presignedUrl host is required")
+	}
+
+	isLocalName := host == "localhost" || strings.HasSuffix(host, ".localhost")
+	isPrivateIP := false
+	if ip := net.ParseIP(host); ip != nil {
+		isPrivateIP = isPrivateOrLocalIP(ip)
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		// Always allowed to proceed; host validation below still applies.
+	case "http":
+		if !(allowPrivate && (isLocalName || isPrivateIP)) {
+			return fmt.Errorf("presignedUrl must use https")
+		}
+	default:
+		return fmt.Errorf("presignedUrl must use https")
+	}
+
+	if isLocalName || isPrivateIP {
+		if allowPrivate {
+			return nil
+		}
+		return fmt.Errorf("presignedUrl host is not allowed")
+	}
+
+	if !isAllowedPresignedHost(host, allowedHostSuffixes) {
+		return fmt.Errorf("presignedUrl host is not in allowlist")
+	}
+
+	return nil
+}
+
+func isAllowedPresignedHost(host string, suffixes []string) bool {
+	for _, suffix := range suffixes {
+		s := strings.ToLower(strings.TrimSpace(suffix))
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, ".") {
+			base := strings.TrimPrefix(s, ".")
+			if host == base || strings.HasSuffix(host, s) {
+				return true
+			}
+			continue
+		}
+		if host == s || strings.HasSuffix(host, "."+s) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivateOrLocalIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip.IsPrivate() {
+		return true
+	}
+	if v4 := ip.To4(); v4 != nil && v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
+		return true
+	}
+	return false
+}
+
 func isPreviewAllowed(fileType string) bool {
 	switch fileType {
 	case "document/pdf", "document/docx", "document/xlsx", "document/pptx", "document/opendocument", "document/epub", "document/rtf", "document/html", "text", "structured/csv", "structured/json", "structured/xml", "structured/yaml", "code/source", "code/notebook", "code/latex":
@@ -589,4 +780,13 @@ func writeErr(w http.ResponseWriter, status int, code, message string) {
 		"error":   message,
 		"code":    code,
 	})
+}
+
+func logExtractionSuccess(fileType string, fileSize int64, duration time.Duration) {
+	extractionLogger.Info(
+		"file_processed",
+		"file_type", sanitizeLogString(fileType),
+		"file_size_bytes", fileSize,
+		"duration_ms", duration.Milliseconds(),
+	)
 }

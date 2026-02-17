@@ -1,0 +1,12 @@
+# Code Style and Conventions
+- Languages: Go for extraction service, TypeScript for Cloudflare Worker edge proxy.
+- Error handling style:
+  - JSON response envelopes (`success`, `error`, optional `code`) at API boundaries.
+  - Context-aware processing with explicit timeout/limit checks.
+- Service design patterns:
+  - Route requests through extractor registry by MIME/extension.
+  - Keep extraction result normalized (`text`, `method`, `fileType`, `mimeType`, counts, metadata/pages).
+  - Use semaphores/rate controls for expensive operations.
+- Security/auth patterns:
+  - Internal container routes protected by `X-Internal-Auth` shared secret.
+  - Worker validates object keys and proxies to container; container endpoints are intended internal-only.
