@@ -27,7 +27,7 @@ const (
 	openRouterAPIURL   = "https://openrouter.ai/api/v1/chat/completions"
 	visionMaxRetries   = 1
 	visionRetryDelay   = 2 * time.Second
-	defaultVisionModel = "mistralai/mistral-small-3.1-24b-instruct"
+	defaultVisionModel = "google/gemma-3-27b-it"
 )
 
 // classificationPrompt asks the model to classify the image and produce a

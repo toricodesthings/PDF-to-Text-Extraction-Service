@@ -235,12 +235,24 @@ func runOCR(ctx context.Context, imageURL, model string) (string, error) {
 }
 
 // processOCROnly is the fallback path when vision is unavailable.
-// This preserves the original behaviour of the endpoint.
+// Applies the same quality gate as the vision-routed branches:
+// if OCR produces garbage (emoji, stray symbols, etc.) we fail
+// explicitly rather than returning meaningless text.
 func processOCROnly(ctx context.Context, imageURL, model string) (types.ImageExtractionResult, error) {
 	ocrText, err := runOCR(ctx, imageURL, model)
 	if err != nil {
 		msg := sanitiseOCRError(err)
 		return types.ImageExtractionResult{Error: &msg}, err
+	}
+
+	if !isOCRMeaningful(ocrText) {
+		msg := "image contains no extractable text"
+		fmt.Printf("[image] OCR-only fallback produced non-meaningful output, failing extraction\n")
+		return types.ImageExtractionResult{
+			Success: false,
+			Method:  "ocr",
+			Error:   &msg,
+		}, errors.New(msg)
 	}
 
 	return types.ImageExtractionResult{

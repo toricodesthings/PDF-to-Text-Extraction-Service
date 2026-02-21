@@ -143,7 +143,7 @@ func Load() Config {
 		DefaultPreviewMaxChars:      envInt("DEFAULT_PREVIEW_CHARS", 20000),
 		DefaultPreviewNeedsOCRRatio: envFloat("DEFAULT_PREVIEW_NEEDS_OCR_RATIO", 0.25),
 
-		DefaultVisionModel:   envStr("DEFAULT_VISION_MODEL", "mistralai/mistral-small-3.1-24b-instruct"),
+		DefaultVisionModel:   envStr("DEFAULT_VISION_MODEL", "google/gemma-3-27b-it"),
 		VisionRequestTimeout: envDur("VISION_REQUEST_TIMEOUT", 30*time.Second),
 
 		GroqAPIURL: envStr("GROQ_API_URL", "https://api.groq.com/openai/v1/audio/transcriptions"),
