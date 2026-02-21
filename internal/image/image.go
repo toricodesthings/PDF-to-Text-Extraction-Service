@@ -81,13 +81,14 @@ func ProcessImage(ctx context.Context, imageURL, ocrModel, visionModel string, v
 	}
 
 	lower := strings.ToLower(imageURL)
-	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
-		msg := "imageUrl must be a valid HTTP/HTTPS URL"
+	isDataURI := strings.HasPrefix(lower, "data:")
+	if !isDataURI && !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		msg := "imageUrl must be a valid HTTP/HTTPS URL or data URI"
 		return types.ImageExtractionResult{Error: &msg}, errors.New(msg)
 	}
 
-	// Reject PDFs — those go through the PDF pipeline
-	if strings.HasSuffix(lower, ".pdf") || strings.Contains(lower, ".pdf?") {
+	// Reject PDFs — those go through the PDF pipeline (not applicable to data URIs)
+	if !isDataURI && (strings.HasSuffix(lower, ".pdf") || strings.Contains(lower, ".pdf?")) {
 		msg := "PDF extraction is handled by the PDF service, not the image endpoint"
 		return types.ImageExtractionResult{Error: &msg}, errors.New(msg)
 	}

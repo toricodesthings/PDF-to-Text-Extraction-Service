@@ -2,6 +2,9 @@ package image
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/toricodesthings/file-processing-service/internal/extract"
@@ -34,7 +37,24 @@ func (e *Extractor) SupportedExtensions() []string {
 }
 
 func (e *Extractor) Extract(ctx context.Context, job extract.Job) (extract.Result, error) {
-	res, err := img.ProcessImage(ctx, job.PresignedURL, e.ocrModel, e.visionModel, e.visionTimeout)
+	imageURL := job.PresignedURL
+	if imageURL == "" && job.LocalPath != "" {
+		// Binary upload path (R2 binding stream): no presigned URL available.
+		// Both Mistral OCR and OpenRouter Vision accept base64 data URIs,
+		// so we encode the local file directly — zero presigning overhead.
+		data, err := os.ReadFile(job.LocalPath)
+		if err != nil {
+			msg := fmt.Sprintf("failed to read local image file: %v", err)
+			return extract.Result{Success: false, Method: "image", FileType: e.Name(), MIMEType: job.MIMEType, Error: &msg}, err
+		}
+		mime := job.MIMEType
+		if mime == "" {
+			mime = "image/png"
+		}
+		imageURL = fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data))
+	}
+
+	res, err := img.ProcessImage(ctx, imageURL, e.ocrModel, e.visionModel, e.visionTimeout)
 	if err != nil {
 		msg := err.Error()
 		return extract.Result{Success: false, Method: "image", FileType: e.Name(), MIMEType: job.MIMEType, Error: &msg}, err
