@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/toricodesthings/file-processing-service/internal/ocr"
 	"github.com/toricodesthings/file-processing-service/internal/types"
@@ -28,6 +29,8 @@ var (
 	zeroWidthChars     = regexp.MustCompile("[\u200B-\u200D\uFEFF\u00AD\u2060]")
 	standaloneImgName  = regexp.MustCompile(`(?mi)^[\w-]*(?:img|image|figure|fig|photo|pic)[\w-]*\.(jpeg|jpg|png|gif|webp|svg|bmp|tiff?)[ \t]*$`)
 	standaloneFileName = regexp.MustCompile(`(?mi)^[\w-]+\.(jpeg|jpg|png|gif|webp|svg|bmp|tiff?)[ \t]*$`)
+	markdownImageRef   = regexp.MustCompile(`(?m)!\[[^\]]*\]\([^)]*\)`)
+	markdownLinkRef    = regexp.MustCompile(`(?m)\[[^\]]*\]\([^)]*\.(jpeg|jpg|png|gif|webp|svg|bmp|tiff?)\)`)
 	excessiveNewlines  = regexp.MustCompile(`\n{4,}`)
 	trailingSpaces     = regexp.MustCompile(`(?m)[ \t]+$`)
 )
@@ -38,6 +41,8 @@ func cleanOCRText(text string) string {
 	}
 
 	text = zeroWidthChars.ReplaceAllString(text, "")
+	text = markdownImageRef.ReplaceAllString(text, "")
+	text = markdownLinkRef.ReplaceAllString(text, "")
 	text = standaloneImgName.ReplaceAllString(text, "")
 	text = standaloneFileName.ReplaceAllString(text, "")
 
@@ -49,6 +54,40 @@ func cleanOCRText(text string) string {
 	text = excessiveNewlines.ReplaceAllString(text, "\n\n\n")
 
 	return strings.TrimSpace(text)
+}
+
+// isOCRMeaningful checks whether OCR output contains actual readable text
+// rather than just symbols, emoji, or OCR artifacts from non-text images.
+// Returns false for garbage output like lone emoji, stray punctuation, etc.
+func isOCRMeaningful(text string) bool {
+	if text == "" {
+		return false
+	}
+
+	// Count actual alphanumeric / letter characters vs total runes.
+	var letters, total int
+	for _, r := range text {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		total++
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			letters++
+		}
+	}
+
+	// Fewer than 3 letter/digit characters is almost certainly not real text.
+	if letters < 3 {
+		return false
+	}
+
+	// If less than 30% of non-space characters are letters/digits,
+	// it's likely OCR artifacts (symbols, emoji, markdown remnants).
+	if total > 0 && float64(letters)/float64(total) < 0.30 {
+		return false
+	}
+
+	return true
 }
 
 // combineOCRPages joins OCR page markdown into a single string.
@@ -111,9 +150,13 @@ func ProcessImage(ctx context.Context, imageURL, ocrModel, visionModel string, v
 		// Text-heavy content (handwriting, docs, screenshots, whiteboards)
 		// → OCR provides the primary text; vision description is supplementary
 		ocrResult, err := runOCR(ctx, imageURL, ocrModel)
-		if err != nil {
-			// OCR failed but we still have the vision description
-			fmt.Printf("[image] OCR failed for text content, using vision description: %v\n", err)
+		if err != nil || !isOCRMeaningful(ocrResult) {
+			// OCR failed or produced garbage — fall back to vision description
+			if err != nil {
+				fmt.Printf("[image] OCR failed for text content, using vision description: %v\n", err)
+			} else {
+				fmt.Printf("[image] OCR produced non-meaningful output for text content, using vision description\n")
+			}
 			return types.ImageExtractionResult{
 				Success:     true,
 				Text:        visionResult.Description,
@@ -135,8 +178,12 @@ func ProcessImage(ctx context.Context, imageURL, ocrModel, visionModel string, v
 		// Significant text AND visual content (diagrams, charts, infographics)
 		// → OCR for text extraction + vision description for visual context
 		ocrResult, err := runOCR(ctx, imageURL, ocrModel)
-		if err != nil {
-			fmt.Printf("[image] OCR failed for mixed content, using vision description: %v\n", err)
+		if err != nil || !isOCRMeaningful(ocrResult) {
+			if err != nil {
+				fmt.Printf("[image] OCR failed for mixed content, using vision description: %v\n", err)
+			} else {
+				fmt.Printf("[image] OCR produced non-meaningful output for mixed content, using vision description\n")
+			}
 			return types.ImageExtractionResult{
 				Success:     true,
 				Text:        visionResult.Description,
